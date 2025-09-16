@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { Operation, TransactionBuilder } from 'soroban-client';
+import { Operation, TransactionBuilder } from '@stellar/stellar-sdk';
 import { z } from 'zod';
 import { env } from '../../features/config/env';
 import { logger } from '../../features/config/logger';
@@ -55,7 +55,7 @@ sorobanRouter.post('/prepare/invoke', sorobanRateLimiter, async (req, res) => {
 
     const prepared = (await sorobanServer.prepareTransaction(
       baseTransaction,
-      env.stellarNetworkPassphrase
+    //   env.stellarNetworkPassphrase
     )) as typeof baseTransaction;
 
     const validUntil = prepared.timeBounds?.maxTime ? Number(prepared.timeBounds.maxTime) : null;

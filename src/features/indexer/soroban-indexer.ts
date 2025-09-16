@@ -1,16 +1,50 @@
 import { Buffer } from 'node:buffer';
-import { SorobanRpc, xdr } from 'soroban-client';
 import { Timestamp } from 'firebase-admin/firestore';
+
+import { rpc as SorobanRpc, xdr, scValToNative } from '@stellar/stellar-sdk'; // <-- 1) use o SDK novo
+//               ^^^ alias "rpc" vira "SorobanRpc"
+
 import { env } from '../config/env';
 import { firestore } from '../firebase/firestore';
 import { logger } from '../config/logger';
 import { collections, EventDocument, serverTimestamp } from '../firebase/collections';
-import { scValToNative, sorobanServer } from '../soroban/soroban-service';
+
+// ===== RPC server & type aliases =====
+const sorobanServer = new SorobanRpc.Server(env.sorobanRpcUrl, { allowHttp: false });
+
+// inferir tipos a partir da API real do Server (evita depender de tipos não exportados)
+type RpcServer = InstanceType<typeof SorobanRpc.Server>;
+type GetEventsParams = Parameters<RpcServer['getEvents']>[0];
+type GetEventsResult = Awaited<ReturnType<RpcServer['getEvents']>>;
+type RpcEvent = GetEventsResult['events'][number];
+
+
+
+
+
+
+
+// import { Buffer } from 'node:buffer';
+// import { SorobanRpc, xdr } from 'soroban-client';
+// import { rpc as SorobanRpc, xdr, scValToNative } from 'stellar-sdk';
+// const sorobanServer = new SorobanRpc.Server(env.sorobanRpcUrl, { allowHttp: false });
+// type RpcServer = InstanceType<typeof SorobanRpc.Server>;
+// type RpcEvent = Awaited<ReturnType<RpcServer['getEvents']>>['events'][number];
+
+// import { Timestamp } from 'firebase-admin/firestore';
+// import { env } from '../config/env';
+// import { firestore } from '../firebase/firestore';
+// import { logger } from '../config/logger';
+// import { collections, EventDocument, serverTimestamp } from '../firebase/collections';
+// import { scValToNative, sorobanServer } from '../soroban/soroban-service';
+// import { SorobanRpc, xdr, scValToNative } from '@stellar/soroban-client';
+// import { rpc as SorobanRpc, xdr, scValToNative } from '@stellar/stellar-sdk';
 
 const INDEXER_CURSOR_DOC_ID = 'soroban_events_cursor';
 const POLL_INTERVAL_MS = 4000;
 const MAX_BACKOFF_MS = 60000;
 const EVENTS_LIMIT = 50;
+const LOOKBACK_LEDGERS = 5000;
 
 const allowedEventTypes: EventDocument['type'][] = [
     'PositionCreated',
@@ -20,6 +54,11 @@ const allowedEventTypes: EventDocument['type'][] = [
     'Withdrawn',
 ];
 
+const getEventPagingToken = (ev: RpcEvent): string | undefined => {
+    const anyEv = ev as any;
+    return anyEv?.pagingToken ?? anyEv?.paging_token ?? undefined;
+};
+
 type NormalizedEvent = {
     type: EventDocument['type'];
     positionId: string;
@@ -27,7 +66,6 @@ type NormalizedEvent = {
     ledgerClosedAt: string;
     txHash: string;
     payload: Record<string, unknown>;
-    pagingToken: string;
 };
 
 const normalizeNative = (input: unknown): unknown => {
@@ -104,40 +142,27 @@ const pickNumber = (source: Record<string, unknown>, keys: string[]): number | u
     return undefined;
 };
 
-const normalizeEvent = (
-    event: SorobanRpc.GetEventsResponse['events'][number]
-): NormalizedEvent | null => {
+const normalizeEvent = (event: RpcEvent): NormalizedEvent | null => {
     const decoded = decodeScVal(event.value);
-
-    if (!decoded || typeof decoded !== 'object') {
-        logger.debug({ id: event.id }, 'Skipping Soroban event without structured payload');
-        return null;
-    }
+    if (!decoded || typeof decoded !== 'object') return null;
 
     const payload = decoded as Record<string, unknown>;
     const typeRaw = pickString(payload, ['event_type', 'eventType', 'type']);
-
-    if (!typeRaw || !allowedEventTypes.includes(typeRaw as EventDocument['type'])) {
-        logger.debug({ id: event.id, typeRaw }, 'Skipping Soroban event with unsupported type');
-        return null;
-    }
+    if (!typeRaw || !allowedEventTypes.includes(typeRaw as EventDocument['type'])) return null;
 
     const positionId = pickString(payload, ['position_id', 'positionId', 'position']);
-    if (!positionId) {
-        logger.debug({ id: event.id }, 'Skipping Soroban event without position id');
-        return null;
-    }
+    if (!positionId) return null;
 
-    const txHash = pickString(payload, ['tx_hash', 'txHash', 'transaction_hash']) ?? event.id;
+    const txHash = pickString(payload, ['tx_hash', 'txHash', 'transaction_hash']) ?? (event as any).id;
+    const ledgerClosedAt = (event as any).ledgerClosedAt ?? new Date().toISOString();
 
     return {
         type: typeRaw as EventDocument['type'],
         positionId,
-        ledger: event.ledger,
-        ledgerClosedAt: event.ledgerClosedAt,
+        ledger: (event as any).ledger,
+        ledgerClosedAt,
         txHash,
         payload,
-        pagingToken: event.pagingToken,
     };
 };
 
@@ -223,7 +248,7 @@ const applyEventToPosition = async (event: NormalizedEvent) => {
     });
 };
 
-const persistEvent = async (event: SorobanRpc.GetEventsResponse['events'][number]) => {
+const persistEvent = async (event: RpcEvent) => {
     const normalized = normalizeEvent(event);
     if (!normalized) {
         return;
@@ -299,24 +324,27 @@ export const startSorobanIndexer = () => {
     };
 
     const tick = async () => {
-        if (running || stopped) {
-            return;
-        }
-
+        if (running || stopped) return;
         running = true;
         try {
             const cursor = await loadCursor();
-            const response = await sorobanServer.getEvents({
-                filters: [
-                    {
-                        type: 'contract',
-                        contractIds: env.contractIds,
-                    },
-                ],
-                cursor: cursor ?? undefined,
-                limit: EVENTS_LIMIT,
-            });
 
+            // Monte a request com startLedger OU cursor
+            const req: GetEventsParams & { startLedger?: number } = {
+                filters: [{ type: 'contract', contractIds: env.contractIds }],
+                limit: EVENTS_LIMIT,
+            };
+
+            if (cursor && cursor.trim().length > 0) {
+                req.cursor = cursor; // continua de onde parou
+            } else {
+                // primeira execução: derive um startLedger válido (evita "startLedger must be positive")
+                const latest = await sorobanServer.getLatestLedger();
+                const start = Math.max(1, (latest?.sequence ?? 1) - LOOKBACK_LEDGERS);
+                req.startLedger = start; // <- sem @ts-expect-error, pois tipamos acima
+            }
+
+            const response = await sorobanServer.getEvents(req);
             const events = response.events ?? [];
 
             if (events.length === 0) {
@@ -326,15 +354,15 @@ export const startSorobanIndexer = () => {
             }
 
             for (const event of events) {
-                try {
-                    await persistEvent(event);
-                } catch (err) {
-                    logger.error({ err, eventId: event.id }, 'Failed to persist Soroban event');
-                }
+                try { await persistEvent(event); }
+                catch (err) { logger.error({ err, eventId: event.id }, 'Failed to persist Soroban event'); }
             }
 
-            const lastCursor = events[events.length - 1]?.pagingToken;
-            if (lastCursor) {
+            // const lastCursor = events[events.length - 1]?.pagingToken;
+            const last = events[events.length - 1];
+            const lastCursor = last ? getEventPagingToken(last) : undefined;
+
+            if (lastCursor && lastCursor.trim().length > 0) {
                 await saveCursor(lastCursor);
             }
 
