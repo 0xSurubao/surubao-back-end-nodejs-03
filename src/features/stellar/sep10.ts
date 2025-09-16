@@ -3,7 +3,24 @@ import { env } from '../config/env';
 
 const CHALLENGE_TIMEOUT_SECONDS = 60 * 5;
 
-const serverKeypair = Keypair.fromSecret(env.sep10ServerSecret);
+let cachedServerKeypair: Keypair | null = null;
+
+const ensureServerKeypair = () => {
+  if (cachedServerKeypair) {
+    return cachedServerKeypair;
+  }
+
+  if (!StrKey.isValidEd25519SecretSeed(env.sep10ServerSecret)) {
+    throw new Sep10Error('Environment variable SEP10_SERVER_SK must be a valid Stellar secret key');
+  }
+
+  try {
+    cachedServerKeypair = Keypair.fromSecret(env.sep10ServerSecret);
+    return cachedServerKeypair;
+  } catch (err) {
+    throw new Sep10Error(`Failed to parse SEP10 server secret: ${(err as Error).message}`);
+  }
+};
 
 const isValidAccount = (accountId: string) =>
   StrKey.isValidEd25519PublicKey(accountId) || StrKey.isValidMed25519PublicKey(accountId);
@@ -20,6 +37,7 @@ export const buildSep10Challenge = (clientAccountId: string) => {
     throw new Sep10Error('Invalid Stellar account identifier');
   }
 
+  const serverKeypair = ensureServerKeypair();
   const challengeXDR = WebAuth.buildChallengeTx(
     serverKeypair,
     clientAccountId,
@@ -44,6 +62,7 @@ export const verifySep10Challenge = (signedXDR: string, clientAccountId: string)
   }
 
   try {
+    const serverKeypair = ensureServerKeypair();
     const { clientAccountID } = WebAuth.readChallengeTx(
       signedXDR,
       serverKeypair.publicKey(),
@@ -82,4 +101,6 @@ export const verifySep10Challenge = (signedXDR: string, clientAccountId: string)
   }
 };
 
-export const getServerAccount = () => serverKeypair.publicKey();
+export const getServerAccount = () => ensureServerKeypair().publicKey();
+
+export const getServerKeypair = () => ensureServerKeypair();

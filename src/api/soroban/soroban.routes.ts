@@ -1,11 +1,12 @@
 import { Router } from 'express';
-import { Keypair, Operation, TransactionBuilder } from 'soroban-client';
+import { Operation, TransactionBuilder } from 'soroban-client';
 import { z } from 'zod';
 import { env } from '../../features/config/env';
 import { logger } from '../../features/config/logger';
 import { optionalJwt } from '../../features/auth/auth-middleware';
 import { sorobanRateLimiter } from '../../features/rate-limit/rate-limit';
 import { nativeToScVal, sorobanServer } from '../../features/soroban/soroban-service';
+import { getServerKeypair } from '../../features/stellar/sep10';
 
 const requestSchema = z.object({
   contractId: z.string().min(1, 'contractId is required'),
@@ -28,7 +29,7 @@ sorobanRouter.post('/prepare/invoke', sorobanRateLimiter, async (req, res) => {
 
   try {
     const { contractId, method, args, fee, timeoutSecs } = parsed.data;
-    const serverKeypair = Keypair.fromSecret(env.sep10ServerSecret);
+    const serverKeypair = getServerKeypair();
     const sourceAccount = await sorobanServer.getAccount(serverKeypair.publicKey());
 
     let scArgs;
