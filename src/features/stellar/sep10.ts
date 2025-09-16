@@ -3,6 +3,13 @@ import { env } from '../config/env';
 
 const CHALLENGE_TIMEOUT_SECONDS = 60 * 5;
 
+export class Sep10Error extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'Sep10Error';
+  }
+}
+
 let cachedServerKeypair: Keypair | null = null;
 
 const ensureServerKeypair = () => {
@@ -24,13 +31,6 @@ const ensureServerKeypair = () => {
 
 const isValidAccount = (accountId: string) =>
   StrKey.isValidEd25519PublicKey(accountId) || StrKey.isValidMed25519PublicKey(accountId);
-
-export class Sep10Error extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = 'Sep10Error';
-  }
-}
 
 export const buildSep10Challenge = (clientAccountId: string) => {
   if (!isValidAccount(clientAccountId)) {
